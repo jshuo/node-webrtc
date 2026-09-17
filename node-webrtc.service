@@ -1,0 +1,41 @@
+[Unit]
+Description=Headless WebRTC Camera Stream Server (rpicam-vid + node-webrtc)
+Documentation=https://github.com/WonderInventions/node-webrtc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a non-root user that has access to the camera (e.g. member of the 'video' group).
+# Change 'pi' to your actual username if different.
+User=secux
+Group=secux
+WorkingDirectory=/home/secux/node-webrtc
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+Environment=WIDTH=640
+Environment=HEIGHT=480
+Environment=FPS=30
+# Adjust the node path if your Node.js is installed elsewhere (check with: which node).
+ExecStart=/home/secux/.nvm/versions/node/v24.21.0/bin/node /home/secux/node-webrtc/server.js
+Restart=always
+RestartSec=5
+# Give the camera time to release the device before restarting.
+TimeoutStopSec=10
+KillSignal=SIGTERM
+# Logging goes to the systemd journal (view with: journalctl -u node-webrtc -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node-webrtc
+
+# --- Hardening (optional but recommended) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Camera access requires the 'video' group; keep device access open.
+PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

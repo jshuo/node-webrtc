@@ -5,11 +5,21 @@ const { spawn } = require('child_process');
 const { RTCPeerConnection, MediaStream, nonstandard } = require('@roamhq/wrtc');
 const { RTCVideoSource } = nonstandard;
 
-const PORT = 3000;
-const WIDTH = 640;
-const HEIGHT = 480;
-const FPS = 30;
+// --- Headless configuration (overridable via environment variables) ---
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const WIDTH = parseInt(process.env.WIDTH, 10) || 640;
+const HEIGHT = parseInt(process.env.HEIGHT, 10) || 480;
+const FPS = parseInt(process.env.FPS, 10) || 30;
 const FRAME_SIZE = WIDTH * HEIGHT * 1.5; // YUV420p byte size
+
+// Simple timestamped logger (systemd captures stdout/stderr into the journal)
+function log(...args) {
+  console.log(`[${new Date().toISOString()}]`, ...args);
+}
+function logError(...args) {
+  console.error(`[${new Date().toISOString()}]`, ...args);
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -20,7 +30,7 @@ const videoSource = new RTCVideoSource();
 const videoTrack = videoSource.createTrack();
 const mediaStream = new MediaStream([videoTrack]); // Wrap in stream for browser compatibility
 
-// 2. Start rpicam-vid
+// 2. Start rpicam-vid (headless: no preview window)
 const cameraProcess = spawn('rpicam-vid', [
   '-t', '0',
   '--width', `${WIDTH}`,
@@ -32,8 +42,14 @@ const cameraProcess = spawn('rpicam-vid', [
   '-o', '-'
 ]);
 
-cameraProcess.stderr.on('data', (data) => console.error(`rpicam-vid: ${data}`));
-cameraProcess.on('error', (err) => console.error('rpicam-vid Error:', err.message));
+cameraProcess.stderr.on('data', (data) => logError(`rpicam-vid: ${data.toString().trim()}`));
+cameraProcess.on('error', (err) => logError('rpicam-vid Error:', err.message));
+cameraProcess.on('exit', (code, signal) => {
+  logError(`rpicam-vid exited (code=${code}, signal=${signal})`);
+  // In a headless service, a dead camera means the stream is useless.
+  // Shut down so systemd can restart the whole unit.
+  shutdown(`camera process exited (code=${code}, signal=${signal})`);
+});
 
 // 3. Fixed Fixed-Buffer Ingestion Engine (Zero Reallocations)
 let frameBuffer = Buffer.allocUnsafe(FRAME_SIZE);
@@ -67,7 +83,10 @@ cameraProcess.stdout.on('data', (chunk) => {
 });
 
 // 4. WebSocket Signaling
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const clientAddr = req.socket.remoteAddress;
+  log(`Client connected: ${clientAddr}`);
+
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
   });
@@ -94,13 +113,16 @@ wss.on('connection', (ws) => {
         await pc.addIceCandidate(data.candidate);
       }
     } catch (err) {
-      console.error('Signaling Error:', err);
+      logError('Signaling Error:', err);
     }
   });
 
   ws.on('close', () => {
+    log(`Client disconnected: ${clientAddr}`);
     pc.close();
   });
+
+  ws.on('error', (err) => logError('WebSocket Error:', err.message));
 });
 
 // 5. Client Interface
@@ -113,19 +135,23 @@ app.get('/', (req, res) => {
       <style>
         body { font-family: system-ui, sans-serif; background: #111; color: #fff; text-align: center; margin-top: 40px; }
         video { width: 100%; max-width: 640px; border: 1px solid #333; background: #000; border-radius: 8px; }
-        button { padding: 12px 24px; font-size: 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; }
-        button:hover { background: #1d4ed8; }
+        #status { margin-top: 12px; font-size: 14px; color: #9ca3af; }
       </style>
     </head>
     <body>
       <h2>Live Pi Camera Stream</h2>
-      <video id="remoteVideo" autoplay playsinline muted></video><br/><br/>
-      <button onclick="startStream()">Start Stream</button>
+      <video id="remoteVideo" autoplay playsinline muted></video>
+      <div id="status">Connecting…</div>
 
       <script>
         let pc, ws;
 
+        function setStatus(text) {
+          document.getElementById('status').textContent = text;
+        }
+
         async function startStream() {
+          setStatus('Connecting…');
           const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
           ws = new WebSocket(\`\${wsProtocol}//\${location.host}\`);
 
@@ -142,11 +168,20 @@ app.get('/', (req, res) => {
               const inboundStream = new MediaStream([event.track]);
               videoElem.srcObject = inboundStream;
             }
+            videoElem.play().catch(() => {});
+            setStatus('Streaming');
           };
 
           pc.onicecandidate = (event) => {
             if (event.candidate && ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
+            }
+          };
+
+          pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+              setStatus('Connection lost. Reconnecting…');
+              setTimeout(startStream, 2000);
             }
           };
 
@@ -165,16 +200,55 @@ app.get('/', (req, res) => {
               await pc.addIceCandidate(data.candidate);
             }
           };
+
+          ws.onclose = () => {
+            setStatus('Disconnected. Reconnecting…');
+            setTimeout(startStream, 2000);
+          };
         }
+
+        // Auto-start the stream as soon as the page is loaded.
+        window.addEventListener('load', startStream);
       </script>
     </body>
     </html>
   `);
 });
 
-server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+server.listen(PORT, HOST, () => {
+  log(`Headless WebRTC server listening on http://${HOST}:${PORT}`);
+  log(`Stream config: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+});
 
-process.on('SIGINT', () => {
-  cameraProcess.kill();
-  process.exit();
+// --- Graceful shutdown (systemd sends SIGTERM on stop/restart) ---
+let shuttingDown = false;
+function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`Shutting down: ${reason}`);
+
+  try {
+    if (cameraProcess && !cameraProcess.killed) cameraProcess.kill('SIGTERM');
+  } catch (err) {
+    logError('Failed to stop camera process:', err.message);
+  }
+
+  wss.close();
+  server.close(() => {
+    log('Server closed. Exiting.');
+    process.exit(0);
+  });
+
+  // Force exit if graceful close hangs
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('uncaughtException', (err) => {
+  logError('Uncaught Exception:', err);
+  shutdown('uncaughtException');
+});
+process.on('unhandledRejection', (reason) => {
+  logError('Unhandled Rejection:', reason);
 });
